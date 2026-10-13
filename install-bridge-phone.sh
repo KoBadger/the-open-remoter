@@ -46,7 +46,7 @@ fi
 [ -f "$REPO_DIR/v1v2-bridge.mjs" ] || die "v1v2-bridge.mjs not found next to this script."
 
 # Refuse to install a stale bridge that still has the framing bug.
-if ! grep -q '"content-length"' "$REPO_DIR/v1v2-bridge.mjs"; then
+if ! grep -q 'content-length' "$REPO_DIR/v1v2-bridge.mjs"; then
   warn "this copy of v1v2-bridge.mjs predates the response-framing fix."
   warn "re-run with --fetch to get the current version, or the app may show"
   warn "'Unexpected status line' / 'Unexpected JSON token at \$[1].name'."

@@ -10,16 +10,16 @@
 # ===========================================================================
 set -u
 
+# Shared config: paths, ports, credentials. Sources config.env if present.
+. "$(dirname "$0")/lib.sh"
+
 DESKTOP_IP="${DESKTOP_IP:-100.108.250.70}"
 DESKTOP_PORT="${DESKTOP_PORT:-8899}"
 BASE="http://${DESKTOP_IP}:${DESKTOP_PORT}"
 ARCHIVE="opencode-config-sync.tar.gz"
 
-BOX="ubuntu"
-SERVER_PORT=4096
-BRIDGE_PORT=4097
-USER_NAME="opencode"
-PASS="${OPENCODE_PASS:-Vaporwave1127!}"
+USER_NAME="$OPENCODE_USER"
+PASS="$OPENCODE_PASS"
 
 say() { printf "\n\033[1;36m==> %s\033[0m\n" "$*"; }
 die() { printf "\033[1;31m[x] %s\033[0m\n" "$*"; exit 1; }

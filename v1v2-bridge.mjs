@@ -9,8 +9,17 @@
  *   GET /api/info, /api/event, /api/session, /api/config, /api/provider, /api/model
  *
  * This proxy listens on PORT (default 4097) and forwards V1-style requests to a
- * V2 upstream (default http://127.0.0.1:4096), rewriting paths and adapting the
- * handful of responses whose shape changed.
+ * V2 upstream (default http://127.0.0.1:4096), rewriting paths AND adapting the
+ * responses whose shape changed.
+ *
+ * Shape adaptation has two halves:
+ *   1. Synthetic routes V2 has no equivalent for (/global/health, /global/version,
+ *      /path, /session/status) are built locally.
+ *   2. V2 envelopes are unwrapped/re-wrapped for the V1 routes the app reads:
+ *      /session, /session/{id}, /session/{id}/message, /provider, /config/providers,
+ *      /agent, /command, /config, /global/config.
+ *
+ * Everything else is streamed back verbatim (SSE, message streams, ...).
  *
  * Usage:
  *   node v1v2-bridge.mjs
@@ -21,6 +30,8 @@
  */
 
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { URL } from "node:url";
 
 const PORT = Number(process.env.PORT || 4097);
@@ -48,6 +59,9 @@ function log(...args) {
   if (VERBOSE) console.log(new Date().toISOString(), ...args);
 }
 
+/** V1 routes the bridge answers itself (V2 has no counterpart). */
+const SYNTHETIC = new Set(["/global/health", "/global/version", "/path", "/session/status"]);
+
 /**
  * Map a V1 request path to its V2 equivalent.
  *
@@ -59,7 +73,7 @@ function mapPath(pathname) {
   if (pathname.startsWith("/api/")) return pathname;
 
   // V1-only routes we synthesize locally.
-  if (pathname === "/global/health" || pathname === "/global/version") return null;
+  if (SYNTHETIC.has(pathname)) return null;
 
   // Everything else: prefix with /api/. /global/event -> /api/event,
   // /session -> /api/session, /config -> /api/config, etc.
@@ -108,6 +122,212 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+// ---------------------------------------------------------------------------
+// V1 shape adaptation
+// ---------------------------------------------------------------------------
+
+/** V1 GET routes whose V2 payload is reshaped (keyed by the V1 path). */
+const RESHAPE_GET = new Set([
+  "/session",
+  "/provider",
+  "/config/providers",
+  "/agent",
+  "/command",
+  "/config",
+  "/global/config",
+]);
+
+/** True when this GET needs its payload reshaped rather than streamed. */
+function needsReshape(method, pathname) {
+  if (method !== "GET") return false;
+  if (RESHAPE_GET.has(pathname)) return true;
+  if (/^\/session\/[^/]+$/.test(pathname)) return true; // /session/{id}
+  if (/^\/session\/[^/]+\/message$/.test(pathname)) return true; // message list
+  return false;
+}
+
+/** Unwrap a V2 `{ data: ... }` / `{ location, data }` envelope. */
+function unwrap(json) {
+  if (json && typeof json === "object" && !Array.isArray(json) && "data" in json) {
+    return json.data;
+  }
+  return json;
+}
+
+/**
+ * Build a V1 ServerConfigResponse out of V2's array of config documents.
+ * V1 expects one flat object: { disabled_providers, enabled_providers, model,
+ * small_model, default_agent }.
+ */
+function configFromDocuments(docs) {
+  const out = {};
+  if (!Array.isArray(docs)) return out;
+  for (const doc of docs) {
+    const info = doc && doc.info;
+    if (!info || typeof info !== "object") continue;
+    for (const key of [
+      "disabled_providers",
+      "enabled_providers",
+      "model",
+      "small_model",
+      "default_agent",
+    ]) {
+      if (info[key] !== undefined && out[key] === undefined) out[key] = info[key];
+    }
+  }
+  return out;
+}
+
+/**
+ * V2 splits a message into typed `content` entries that carry their own time and
+ * lack the identity fields V1 clients require, so rebuild both.
+ */
+function partToV1(part, sessionID, messageID, index) {
+  if (!part || typeof part !== "object") return part;
+  const out = { ...part };
+
+  // V1 requires these on every part; V2 only sets id on tool calls.
+  out.id = out.id || `prt_${messageID}_${index}`;
+  out.sessionID = sessionID;
+  out.messageID = messageID;
+
+  // V2 times are {created, completed|ran|streamed}; V1 wants {start, end?}.
+  if (out.time && typeof out.time === "object") {
+    const t = out.time;
+    const start = t.start ?? t.created;
+    const end = t.end ?? t.completed ?? t.ran ?? t.streamed;
+    out.time = { start: start ?? Date.now() };
+    if (end !== undefined) out.time.end = end;
+  }
+
+  switch (out.type) {
+    case "reasoning":
+      delete out.state;
+      if (!out.time) out.time = { start: Date.now() };
+      break;
+    case "text":
+      if (!out.time) out.time = { start: Date.now() };
+      break;
+    case "tool":
+      // V1 Tool part: { callID, tool, state, ... }
+      if (out.callID === undefined) out.callID = out.id;
+      if (out.tool === undefined) out.tool = out.name;
+      delete out.name;
+      delete out.executed;
+      break;
+  }
+  return out;
+}
+
+/**
+ * V1 Message is { id, sessionID, role, time{created,completed?}, parts[] }.
+ * V2 uses { type, model, content[] } and omits sessionID (and, for assistant
+ * messages, the parentID V1 requires).
+ */
+function messageToV1(msg, sessionID, previousID) {
+  if (!msg || typeof msg !== "object") return msg;
+  const out = { ...msg };
+
+  if (out.role === undefined && out.type !== undefined) out.role = out.type;
+  delete out.type;
+  delete out.rawFinish;
+
+  out.sessionID = sessionID;
+
+  const t = out.time && typeof out.time === "object" ? out.time : {};
+  out.time = { created: t.created ?? Date.now() };
+  const completed = t.completed ?? t.streamed;
+  if (completed !== undefined) out.time.completed = completed;
+
+  // V2 nests the model; V1 wants flat modelID/providerID/variant.
+  if (out.model && typeof out.model === "object") {
+    if (out.modelID === undefined) out.modelID = out.model.id;
+    if (out.providerID === undefined) out.providerID = out.model.providerID;
+    if (out.variant === undefined) out.variant = out.model.variant;
+    delete out.model;
+  }
+
+  // Assistant messages must reference the message they answer.
+  if (out.role === "assistant" && !out.parentID) out.parentID = previousID || out.id;
+
+  const content = Array.isArray(out.content)
+    ? out.content
+    : Array.isArray(out.parts)
+      ? out.parts
+      : [];
+  out.parts = content.map((p, i) => partToV1(p, sessionID, out.id, i));
+  delete out.content;
+
+  return out;
+}
+
+/**
+ * V1 GET /session/:id/message returns MessageWithParts[] - each entry is
+ * { info: Message, parts: Part[] }, not a bare Message list.
+ */
+function messageWithPartsToV1(msg, sessionID, previousID) {
+  const info = messageToV1(msg, sessionID, previousID);
+  const parts = Array.isArray(info.parts) ? info.parts : [];
+  delete info.parts;
+  return { info, parts };
+}
+
+/** Reshape a V2 payload into the shape the V1 route promised. */
+function reshape(v1path, json) {
+  const data = unwrap(json);
+
+  switch (v1path) {
+    case "/session":
+    case "/agent":
+    case "/command":
+      return Array.isArray(data) ? data : [];
+    case "/provider":
+      // V1 ProviderCatalogResponse { all, default, connected }
+      return { all: Array.isArray(data) ? data : [], default: {}, connected: [] };
+    case "/config/providers":
+      // V1 ProvidersResponse { providers, default }
+      return { providers: Array.isArray(data) ? data : [], default: {} };
+    case "/config":
+    case "/global/config":
+      return configFromDocuments(Array.isArray(json) ? json : data);
+  }
+
+  if (/^\/session\/[^/]+$/.test(v1path)) return data;
+  if (/^\/session\/[^/]+\/message$/.test(v1path)) {
+    const sessionID = v1path.split("/")[2];
+    const arr = Array.isArray(data) ? data : [];
+    let previousID = null;
+    return arr.map((msg) => {
+      const v1 = messageWithPartsToV1(msg, sessionID, previousID);
+      if (msg && msg.id) previousID = msg.id;
+      return v1;
+    });
+  }
+
+  return undefined;
+}
+
+/** V1 ServerPaths - V2 only reports `paths.tmp`, so derive the rest locally. */
+function serverPaths() {
+  const home = os.homedir();
+  const cwd = process.cwd();
+  return {
+    home,
+    state: path.join(home, ".local", "share", "opencode"),
+    config: path.join(home, ".config", "opencode"),
+    worktree: cwd,
+    directory: cwd,
+  };
+}
+
+async function fetchInfo() {
+  const upstream = await fetch(`${UPSTREAM}/api/info`, {
+    headers: UPSTREAM_AUTH ? { authorization: UPSTREAM_AUTH } : {},
+  });
+  if (!upstream.ok) return null;
+  return upstream.json().catch(() => null);
+}
+
 /**
  * Synthetic V1 routes.
  *
@@ -118,17 +338,9 @@ function sendJson(res, status, obj) {
 async function handleSynthetic(pathname, res) {
   if (pathname === "/global/health") {
     try {
-      const upstream = await fetch(`${UPSTREAM}/api/info`, {
-        headers: UPSTREAM_AUTH ? { authorization: UPSTREAM_AUTH } : {},
-      });
-      if (!upstream.ok) {
-        return sendJson(res, 200, { healthy: false, version: null });
-      }
-      const info = await upstream.json().catch(() => ({}));
-      return sendJson(res, 200, {
-        healthy: true,
-        version: info.version ?? null,
-      });
+      const info = await fetchInfo();
+      if (!info) return sendJson(res, 200, { healthy: false, version: null });
+      return sendJson(res, 200, { healthy: true, version: info.version ?? null });
     } catch (err) {
       log("health probe failed:", err.message);
       // Report unhealthy rather than erroring - clients render this gracefully.
@@ -138,14 +350,21 @@ async function handleSynthetic(pathname, res) {
 
   if (pathname === "/global/version") {
     try {
-      const upstream = await fetch(`${UPSTREAM}/api/info`, {
-        headers: UPSTREAM_AUTH ? { authorization: UPSTREAM_AUTH } : {},
-      });
-      const info = await upstream.json().catch(() => ({}));
-      return sendJson(res, 200, { version: info.version ?? null });
+      const info = await fetchInfo();
+      return sendJson(res, 200, { version: info?.version ?? null });
     } catch {
       return sendJson(res, 200, { version: null });
     }
+  }
+
+  if (pathname === "/path") {
+    return sendJson(res, 200, serverPaths());
+  }
+
+  // V1 reports live session statuses as { <sessionID>: SessionStatus }. V2 only
+  // exposes per-session status, so report none and let the app derive the rest.
+  if (pathname === "/session/status") {
+    return sendJson(res, 200, {});
   }
 
   return sendJson(res, 404, { error: "not found" });
@@ -190,7 +409,19 @@ const server = http.createServer(async (req, res) => {
       duplex: body ? "half" : undefined,
     });
 
-    // Stream the response back verbatim, preserving SSE etc.
+    // --- Reshaped JSON responses (V1 clients need the old shape) -----------
+    if (needsReshape(req.method, pathname)) {
+      const contentType = upstream.headers.get("content-type") || "";
+      let json;
+      if (contentType.includes("application/json")) {
+        json = await upstream.json().catch(() => undefined);
+      }
+      const shaped = json === undefined ? undefined : reshape(pathname, json);
+      log("V1", req.method, pathname, shaped === undefined ? "-> passthrough" : "-> reshaped");
+      return sendJson(res, upstream.status, shaped === undefined ? json ?? {} : shaped);
+    }
+
+    // --- Stream everything else back verbatim (SSE, downloads, ...) --------
     //
     // We must NOT forward content-length: fetch gives us a DECODED body, so any
     // upstream content-length (or transfer-encoding) describes the encoded form

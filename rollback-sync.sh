@@ -11,11 +11,11 @@
 # ===========================================================================
 set -u
 
-BOX="ubuntu"
-SERVER_PORT=4096
-BRIDGE_PORT=4097
-USER_NAME="opencode"
-PASS="${OPENCODE_PASS:-Vaporwave1127!}"
+# Shared config: paths, ports, credentials. Sources config.env if present.
+. "$(dirname "$0")/lib.sh"
+
+USER_NAME="$OPENCODE_USER"
+PASS="$OPENCODE_PASS"
 
 say() { printf "\n\033[1;36m==> %s\033[0m\n" "$*"; }
 
