@@ -86,6 +86,78 @@ function mapPath(pathname) {
   return mapped;
 }
 
+/**
+ * V1 sends a prompt as `POST /session/:id/message` with
+ * `{ parts:[{type:"text",text}], modelID, providerID, agent }`.
+ * V2 exposes `POST /api/session/:id/prompt` taking a plain string `text`.
+ *
+ * Returns `{ path, body }` to rewrite the outgoing request, or null to leave it
+ * untouched. Non-prompt POSTs (and every other method) pass straight through.
+ */
+function rewritePrompt(method, pathname, body) {
+  if (method !== "POST") return null;
+  const m = pathname.match(/^\/session\/([^/]+)\/(message|chat|prompt)$/);
+  if (!m) return null;
+
+  const sessionID = m[1];
+  let text = "";
+  const extra = {};
+
+  if (body && body.length) {
+    let json;
+    try {
+      json = JSON.parse(body.toString("utf8"));
+    } catch {
+      json = null;
+    }
+    if (json && typeof json === "object") {
+      if (typeof json.text === "string") {
+        text = json.text;
+      } else if (Array.isArray(json.parts)) {
+        text = json.parts
+          .filter((p) => p && p.type === "text" && typeof p.text === "string")
+          .map((p) => p.text)
+          .join("\n");
+      }
+      for (const k of ["modelID", "providerID", "agent", "variant"]) {
+        if (json[k] !== undefined) extra[k] = json[k];
+      }
+    }
+  }
+
+  return {
+    path: `/api/session/${sessionID}/prompt`,
+    body: Buffer.from(JSON.stringify({ text, ...extra })),
+    sessionID,
+  };
+}
+
+/** Turn V2's prompt result ({data:{id,payload:{text},...}}) into a V1 Message. */
+function promptResultToV1(data, sessionID) {
+  if (!data || typeof data !== "object") return data;
+  const created = (data.time && data.time.created) || Date.now();
+  const text = data.payload && typeof data.payload.text === "string" ? data.payload.text : "";
+  const sid = data.sessionID || sessionID;
+  return {
+    id: data.id,
+    sessionID: sid,
+    role: "user",
+    time: { created },
+    parts: text
+      ? [
+          {
+            id: `${data.id}_0`,
+            sessionID: sid,
+            messageID: data.id,
+            type: "text",
+            text,
+            time: { start: created },
+          },
+        ]
+      : [],
+  };
+}
+
 /** Read a request body fully. */
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -380,15 +452,12 @@ const server = http.createServer(async (req, res) => {
     return res.end("Unauthorized");
   }
 
-  const mapped = mapPath(pathname);
+  let mapped = mapPath(pathname);
 
   if (mapped === null) {
     log("V1", req.method, pathname, "-> synthetic");
     return handleSynthetic(pathname, res);
   }
-
-  const target = `${UPSTREAM}${mapped}${query}`;
-  log("V1", req.method, pathname, "-> V2", mapped);
 
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
@@ -398,7 +467,17 @@ const server = http.createServer(async (req, res) => {
   if (UPSTREAM_AUTH) headers["authorization"] = UPSTREAM_AUTH;
 
   const hasBody = !["GET", "HEAD"].includes(req.method);
-  const body = hasBody ? await readBody(req) : undefined;
+  let body = hasBody ? await readBody(req) : undefined;
+
+  // V1 prompt sends are translated to V2's /prompt endpoint + {text} body.
+  const prompt = rewritePrompt(req.method, pathname, body);
+  if (prompt) {
+    mapped = prompt.path;
+    body = prompt.body;
+  }
+
+  const target = `${UPSTREAM}${mapped}${query}`;
+  log("V1", req.method, pathname, prompt ? "-> V2 prompt" : "-> V2", mapped);
 
   try {
     const upstream = await fetch(target, {
@@ -408,6 +487,21 @@ const server = http.createServer(async (req, res) => {
       redirect: "manual",
       duplex: body ? "half" : undefined,
     });
+
+    // --- Prompt POSTs: unwrap V2's {data} into a V1 Message -----------------
+    if (prompt) {
+      const contentType = upstream.headers.get("content-type") || "";
+      let json;
+      if (contentType.includes("application/json")) {
+        json = await upstream.json().catch(() => undefined);
+      }
+      // Upstream validation errors ({_tag:...}) are surfaced unchanged.
+      if (json && typeof json === "object" && json._tag) {
+        return sendJson(res, upstream.status, json);
+      }
+      const data = json && typeof json === "object" && json.data !== undefined ? json.data : json;
+      return sendJson(res, upstream.status, promptResultToV1(data, prompt.sessionID));
+    }
 
     // --- Reshaped JSON responses (V1 clients need the old shape) -----------
     if (needsReshape(req.method, pathname)) {
