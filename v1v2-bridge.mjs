@@ -60,7 +60,13 @@ function log(...args) {
 }
 
 /** V1 routes the bridge answers itself (V2 has no counterpart). */
-const SYNTHETIC = new Set(["/global/health", "/global/version", "/path", "/session/status"]);
+const SYNTHETIC = new Set([
+  "/global/health",
+  "/global/version",
+  "/path",
+  "/session/status",
+  "/permission",
+]);
 
 /**
  * Map a V1 request path to its V2 equivalent.
@@ -437,6 +443,14 @@ async function handleSynthetic(pathname, res) {
   // exposes per-session status, so report none and let the app derive the rest.
   if (pathname === "/session/status") {
     return sendJson(res, 200, {});
+  }
+
+  // V1 polls this for pending permission prompts and expects a list. V2 delivers
+  // them over the event stream instead, so the bridge has none to hand back.
+  // Answering with an empty list keeps the app from logging a transform failure
+  // on every poll.
+  if (pathname === "/permission") {
+    return sendJson(res, 200, []);
   }
 
   return sendJson(res, 404, { error: "not found" });
